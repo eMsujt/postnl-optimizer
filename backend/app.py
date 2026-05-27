@@ -1,6 +1,10 @@
 """
 PostNL Route Optimizer — OR-Tools TSP backend
 Deploy on Render (free or starter plan) and paste the URL into app.js.
+
+v2: accepts an optional 'duration_matrix' field (n×n road-duration seconds from OSRM)
+    so OR-Tools optimises by real road travel time instead of straight-line distance.
+    Falls back to haversine when no matrix is supplied.
 """
 
 import math
@@ -21,13 +25,38 @@ def haversine_m(lat1, lng1, lat2, lng2):
     return int(R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)))
 
 
-def build_matrix(coords):
+def build_haversine_matrix(coords):
     n = len(coords)
     return [
         [0 if i == j else haversine_m(coords[i][0], coords[i][1], coords[j][0], coords[j][1])
          for j in range(n)]
         for i in range(n)
     ]
+
+
+def blend_matrix(stop_coords, depot_coords, road_matrix):
+    """
+    Build an (n+1)×(n+1) distance matrix:
+      row/col 0       = depot — uses haversine for all depot arcs
+      rows/cols 1..n  = delivery stops — uses OSRM road durations
+    Null entries in road_matrix fall back to haversine.
+    """
+    n = len(stop_coords)
+    all_coords = [depot_coords] + list(stop_coords)
+    hav = build_haversine_matrix(all_coords)
+
+    matrix = [[0] * (n + 1) for _ in range(n + 1)]
+    # Depot row and column: always haversine
+    for j in range(n + 1):
+        matrix[0][j] = hav[0][j]
+        matrix[j][0] = hav[j][0]
+    # Stop-to-stop: prefer OSRM road durations, fall back to haversine
+    for i in range(n):
+        for j in range(n):
+            v = road_matrix[i][j]
+            matrix[i + 1][j + 1] = int(v) if (v is not None and v >= 0) else hav[i + 1][j + 1]
+
+    return matrix
 
 
 def solve_tsp(matrix, depot=0, time_limit=20):
@@ -70,28 +99,50 @@ def optimize():
     data  = request.get_json(force=True)
     stops = data.get('stops', [])
     start = data.get('start_location')
+    # Optional OSRM road-duration matrix: n×n seconds, stop indices only (no depot row)
+    road_matrix = data.get('duration_matrix')
 
     if len(stops) < 2:
         return jsonify({'order': list(range(len(stops))), 'distance_m': 0})
 
+    n = len(stops)
     stop_coords = [(s['lat'], s['lng']) for s in stops]
 
-    if start:
-        # Node 0 = driver's current GPS position (depot), nodes 1..n = delivery stops.
-        # Open TSP: driver does not return to depot → zero out return arcs.
-        all_coords = [(start['lat'], start['lng'])] + stop_coords
-        matrix = build_matrix(all_coords)
-        for row in matrix:
-            row[0] = 0  # free to end anywhere
-        raw = solve_tsp(matrix, depot=0)
-        order = [i - 1 for i in raw if i > 0]
-        total_dist = sum(matrix[raw[i]][raw[i + 1]] for i in range(len(raw) - 1))
-    else:
-        matrix = build_matrix(stop_coords)
-        order = solve_tsp(matrix, depot=0)
-        total_dist = sum(matrix[order[i]][order[i + 1]] for i in range(len(order) - 1))
+    # Validate road matrix dimensions — silently ignore malformed payloads
+    use_road = (
+        road_matrix is not None
+        and isinstance(road_matrix, list)
+        and len(road_matrix) == n
+        and all(isinstance(row, list) and len(row) == n for row in road_matrix)
+    )
 
-    return jsonify({'order': order, 'distance_m': total_dist})
+    if start:
+        depot = (start['lat'], start['lng'])
+
+        if use_road:
+            matrix = blend_matrix(stop_coords, depot, road_matrix)
+        else:
+            all_coords = [depot] + stop_coords
+            matrix = build_haversine_matrix(all_coords)
+
+        # Open TSP: driver does not need to return to depot → zero out return arcs
+        for row in matrix:
+            row[0] = 0
+
+        raw   = solve_tsp(matrix, depot=0)
+        order = [i - 1 for i in raw if i > 0]
+        total = sum(matrix[raw[k]][raw[k + 1]] for k in range(len(raw) - 1))
+    else:
+        if use_road:
+            matrix = [[int(road_matrix[i][j]) if road_matrix[i][j] is not None else 0
+                       for j in range(n)] for i in range(n)]
+        else:
+            matrix = build_haversine_matrix(stop_coords)
+
+        order = solve_tsp(matrix, depot=0)
+        total = sum(matrix[order[k]][order[k + 1]] for k in range(len(order) - 1))
+
+    return jsonify({'order': order, 'distance_m': total})
 
 
 if __name__ == '__main__':
